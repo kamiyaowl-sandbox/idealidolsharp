@@ -1,4 +1,5 @@
-﻿using OpenCvSharp;
+﻿using IdealIdolSharp.Model;
+using OpenCvSharp;
 using OpenCvSharp.CPlusPlus;
 using Reactive.Bindings;
 using System;
@@ -22,6 +23,8 @@ namespace IdealIdolSharp.ViewModel {
         public ReactiveCollection<ProcessParameter> ProcessParameters { get; set; } = new ReactiveCollection<ProcessParameter>();
         public ReactiveProperty<ProcessParameter> ProcessParam { get; set; } = new ReactiveProperty<ProcessParameter>();
 
+        public ReactiveCollection<NoteCircleSegment> InferenceNotes { get; set; } = new ReactiveCollection<NoteCircleSegment>();
+
         public MainViewModel() {
             PlayTestMovieCommand =
                 TestMovieSourcePath.Select(x => File.Exists(x))
@@ -32,6 +35,8 @@ namespace IdealIdolSharp.ViewModel {
 
             var param = new ProcessParameter();
             ProcessParameters.Add(param);
+            ProcessParameters.Add(new ProcessParameter());
+            ProcessParameters.Add(new ProcessParameter());
             ProcessParam.Value = param;
 
             PlayTestMovieCommand.Execute();
@@ -49,7 +54,12 @@ namespace IdealIdolSharp.ViewModel {
                 using (var inputMat = new Mat()) {
                     //データフォーマットを確定
                     cap.Read(inputMat);
-                    using (var diffMat = new Mat(inputMat.Rows, inputMat.Cols, MatType.CV_8UC3))
+                    var width = inputMat.Width;
+                    var height = inputMat.Height;
+                    var rows = inputMat.Rows;
+                    var cols = inputMat.Cols;
+
+                    using (var diffMat = new Mat(rows, cols, MatType.CV_8UC3))
                     using (var prevMat = new Mat()) {
                         //初回データのコピー
                         inputMat.CopyTo(prevMat);
@@ -78,33 +88,25 @@ namespace IdealIdolSharp.ViewModel {
                                ProcessParam.Value.SobelXOrder,
                                ProcessParam.Value.SobelYOrder);
 
-                            //円の図示
-                            //foreach (var c in circles) {
-                            //    inputMat.Circle((int)c.Center.X, (int)c.Center.Y, (int)c.Radius, CvColor.Red, 3);
-                            //}
                             //同じノートの推論
-                            var circlesList = circles.ToList();
-                            foreach (var c in circles) {
-                                circlesList.Remove(c);//これから検索するので消す
-                                var nearest = circlesList.Select(p => {
-                                    var d = p.Center - c.Center;
-                                    return new {
-                                        Point = p,
-                                        Distance = Math.Abs(d.X) + Math.Abs(d.Y)
-                                    };
-                                })
-                                .Where(x => x.Distance < ProcessParam.Value.NearCircleDistance)
-                                .OrderBy(p => p.Distance)
-                                .FirstOrDefault();
-
-                                if (nearest == null) continue;
-                                circlesList.Remove(nearest.Point);//検索済なので消す
-
-                                inputMat.Circle((int)c.Center.X, (int)c.Center.Y, (int)c.Radius, CvColor.Red, 3);
-                                inputMat.Circle((int)nearest.Point.Center.X, (int)nearest.Point.Center.Y, (int)nearest.Point.Radius, CvColor.Blue, 3);
-                                inputMat.Line((int)c.Center.X, (int)c.Center.Y, (int)nearest.Point.Center.X, (int)nearest.Point.Center.Y, CvColor.Purple, 3);
+                            var notes = findPairNotes(inputMat, circles);
+                            foreach (var n in notes) {
+                                inputMat.Circle((int)n.OldPoint.Center.X, (int)n.OldPoint.Center.Y, (int)n.OldPoint.Radius, CvColor.Blue, 3);
+                                inputMat.Circle((int)n.NewPoint.Center.X, (int)n.NewPoint.Center.Y, (int)n.NewPoint.Radius, CvColor.Red, 3);
+                                inputMat.Line((int)n.OldPoint.Center.X, (int)n.OldPoint.Center.Y, (int)n.NewPoint.Center.X, (int)n.NewPoint.Center.Y, CvColor.Green, 3);
+                                inputMat.Line((int)n.NewPoint.Center.X, (int)n.NewPoint.Center.Y, (int)n.InferenceX, ProcessParam.Value.UserTapY, CvColor.LightGreen, 3);
+                                if (n.InferenceLabel.HasValue) inputMat.PutText($"{n.InferenceLabel.Value}", new Point(n.NewPoint.Center.X + ProcessParam.Value.UserTapXClearance / 2, n.NewPoint.Center.Y), FontFace.Italic, 2, CvColor.Cyan, 4);
                             }
+                            InferenceNotes.ClearOnScheduler();
+                            InferenceNotes.AddRangeOnScheduler(notes);
 
+                            //情報の描画
+                            inputMat.Circle(ProcessParam.Value.UserTapX0, ProcessParam.Value.UserTapY, ProcessParam.Value.HoughCircleMaxRadius, CvColor.Purple, 3);
+                            inputMat.Circle(ProcessParam.Value.UserTapX1, ProcessParam.Value.UserTapY, ProcessParam.Value.HoughCircleMaxRadius, CvColor.Purple, 3);
+                            inputMat.Circle(ProcessParam.Value.UserTapX2, ProcessParam.Value.UserTapY, ProcessParam.Value.HoughCircleMaxRadius, CvColor.Purple, 3);
+                            inputMat.Circle(ProcessParam.Value.UserTapX3, ProcessParam.Value.UserTapY, ProcessParam.Value.HoughCircleMaxRadius, CvColor.Purple, 3);
+                            inputMat.Circle(ProcessParam.Value.UserTapX4, ProcessParam.Value.UserTapY, ProcessParam.Value.HoughCircleMaxRadius, CvColor.Purple, 3);
+                            inputMat.Line(0, ProcessParam.Value.UserTapY, width, ProcessParam.Value.UserTapY, CvColor.Purple, 3);
 
                             //show
                             Cv2.ImShow("input", inputMat);
@@ -119,17 +121,42 @@ namespace IdealIdolSharp.ViewModel {
                 CurrentFrame.Value = 0;
             });
         }
+
+        /// <summary>
+        /// 隣接するノードを抽出
+        /// </summary>
+        /// <param name="inputMat"></param>
+        /// <param name="circles"></param>
+        /// <returns></returns>
+        private IEnumerable<NoteCircleSegment> findPairNotes(Mat inputMat, CvCircleSegment[] circles) {
+            var circlesList = circles.OrderBy(p => p.Center.Y).ToList();
+            foreach (var c in circles) {
+                circlesList.Remove(c);//これから検索するので消す
+                var nearest = circlesList.Select(p => new NoteCircleSegment(c, p))
+                .Where(x => x.Distance < ProcessParam.Value.NearCircleDistanceLimit)
+                .Where(x => (x.RadiusRatio < ProcessParam.Value.NearCircleRadiusErrorRange + 1) &&
+                            (1 - ProcessParam.Value.NearCircleRadiusErrorRange < x.RadiusRatio)
+                )
+                .Where(x => Math.Abs(x.Delta) > ProcessParam.Value.AbsDeltaMin)
+                .OrderBy(p => p.Distance)
+                .FirstOrDefault();
+
+                if (nearest == null) continue;
+                circlesList.Remove(nearest.OldPoint);//検索済なので消す
+                circlesList.Remove(nearest.NewPoint);//検索済なので消す
+
+                nearest.Inference(
+                    ProcessParam.Value.UserTapY,
+                    ProcessParam.Value.UserTapXClearance,
+                    ProcessParam.Value.UserTapX0,
+                    ProcessParam.Value.UserTapX1,
+                    ProcessParam.Value.UserTapX2,
+                    ProcessParam.Value.UserTapX3,
+                    ProcessParam.Value.UserTapX4
+                    );
+                yield return nearest;
+            }
+        }
     }
-    public class ProcessParameter {
-        public double DiffGrayThreash { get; set; } = 40;
-        public double HoughCircleDp { get; set; } = 2;
-        public double HoughCircleMinDist { get; set; } = 30;
-        public double HoughCircleParam1 { get; set; } = 160;
-        public double HoughCircleParam2 { get; set; } = 50;
-        public int HoughCircleMinRadius { get; set; } = 10;
-        public int HoughCircleMaxRadius { get; set; } = 40;
-        public int SobelXOrder { get; internal set; } = 1;
-        public int SobelYOrder { get; internal set; } = 0;
-        public float NearCircleDistance { get; set; } = 100;
-    }
+
 }
